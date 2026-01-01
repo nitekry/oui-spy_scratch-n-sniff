@@ -56,8 +56,10 @@ static void detectBeep(){ beepPattern(1); }
 static std::vector<String> filters; // OUI (XX:XX:XX) or full MAC (XX:XX:XX:XX:XX:XX)
 
 struct Observed {
-  String name;   // BLE Complete Local Name or Wi-Fi SSID
-  String source; // "BLE" or "Wi-Fi"
+  String name;    // BLE Complete Local Name or Wi-Fi SSID
+  String source;  // "BLE" or "Wi-Fi"
+  int16_t rssi = -127;   // dBm baseline strength
+  bool hasRssi = false;
 };
 
 enum class BaselineMode { WIFI_ONLY, BLE_ONLY, WIFI_AND_BLE };
@@ -89,6 +91,37 @@ static String macPretty(const String& macNoDelim12){
   for(int i=0;i<12;i+=2){ if(i) p += ':'; p += macNoDelim12.substring(i, i+2); }
   return p;
 }
+
+static inline void setBestRssi(Observed &o, int rssiDbm){
+  // RSSI is negative dBm; closer to 0 is stronger (e.g., -40 > -80)
+  if (!o.hasRssi || rssiDbm > o.rssi){
+    o.rssi = (int16_t)rssiDbm;
+    o.hasRssi = true;
+  }
+}
+
+
+
+// ================================
+// RSSI Color Coding
+// ================================
+static const int RSSI_GREEN  = -55;
+static const int RSSI_YELLOW = -67;
+static const int RSSI_ORANGE = -75;
+
+static const char* rssiClass(bool has, int rssi){
+  if (!has) return "rssi-unk";
+  if (rssi >= RSSI_GREEN)  return "rssi-g";
+  if (rssi >= RSSI_YELLOW) return "rssi-y";
+  if (rssi >= RSSI_ORANGE) return "rssi-o";
+  return "rssi-r";
+}
+
+static String rssiCellHtml(const Observed& o){
+  if (!o.hasRssi) return String("<span class='rssi rssi-unk'>-</span>");
+  return "<span class='rssi " + String(rssiClass(true, o.rssi)) + "'>" + String(o.rssi) + " dBm</span>";
+}
+
 
 static void loadFilters(){
   filters.clear();
@@ -237,6 +270,7 @@ public:
     if (macNo.length()!=12) return;
     Observed &o = entries[macNo];
     o.source = "BLE";
+    setBestRssi(o, dev->getRSSI());
     if (dev->haveName()) {
       String nm = String(dev->getName().c_str());
       if (nm.length()) o.name = nm;
@@ -271,6 +305,14 @@ static const char* INDEX_HTML = R"HTML(
     a{color:#78f0a8}
     th,td{border-bottom:1px solid #26354d}
     .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+
+    /* RSSI pill color coding */
+    .rssi{display:inline-block;min-width:76px;text-align:center;padding:4px 8px;border-radius:999px;font-weight:700}
+    .rssi-unk{background:#2a3344;color:#cbd5e1}
+    .rssi-g{background:#1db954;color:#00100a}
+    .rssi-y{background:#f4d03f;color:#1b1400}
+    .rssi-o{background:#ff9f1a;color:#1f1200}
+    .rssi-r{background:#ff4d4d;color:#1a0000}
   </style>
   <script>
     function addLineOnce(textareaId, value){
@@ -391,6 +433,7 @@ static void baselineTask(void* pv){
         if (bssidNo.length()!=12) continue;
         Observed &o = macMap[bssidNo];
         o.source = "Wi-Fi";
+        setBestRssi(o, WiFi.RSSI(i));
         String ssid = WiFi.SSID(i);
         if (ssid.length() && o.name.length()==0) o.name = ssid;
       }
@@ -411,8 +454,10 @@ static void baselineTask(void* pv){
     std::map<String, Observed>::iterator it2 = macMap.find(mac);
     if (it2 == macMap.end()){
       macMap[mac] = oBle;
-    } else if (it2->second.name.length()==0 && oBle.name.length()){
-      it2->second.name = oBle.name;
+    } else {
+      if (it2->second.name.length()==0 && oBle.name.length()) it2->second.name = oBle.name;
+      // Keep strongest RSSI across sources
+      if (oBle.hasRssi) setBestRssi(it2->second, oBle.rssi);
     }
   }
 
@@ -524,7 +569,7 @@ server.on("/filters_clear", HTTP_POST, [](AsyncWebServerRequest *req){
     }
   });
   server.on("/baseline_results.csv", HTTP_GET, [](AsyncWebServerRequest *req){
-    String payload = lastResultsCSV.length() ? lastResultsCSV : String("MAC,Source,Complete Local Name\n");
+    String payload = lastResultsCSV.length() ? lastResultsCSV : String("MAC,Source,RSSI,Complete Local Name\n");
     AsyncWebServerResponse *res = req->beginResponse(200, "text/csv", payload);
     res->addHeader("Content-Disposition", "attachment; filename=\"baseline_results.csv\"");
     req->send(res);
@@ -597,13 +642,14 @@ static void buildResultsArtifacts(const std::map<String, Observed>& macMap){
 
   // CSV
   String csv; csv.reserve(2048);
-  csv += "MAC,Source,Complete Local Name\n";
+  csv += "MAC,Source,RSSI,Complete Local Name\n";
   for (size_t i=0;i<lastResultsRows.size();++i){
     const String macP = macPretty(lastResultsRows[i].first);
     const String src  = lastResultsRows[i].second.source.length() ? lastResultsRows[i].second.source : String("BLE");
     String nm  = lastResultsRows[i].second.name.length() ? lastResultsRows[i].second.name : String("UNKNOWN");
     nm.replace("\"","\"\"");
-    csv += "\"" + macP + "\",\"" + src + "\",\"" + nm + "\"\n";
+    String rssiStr = lastResultsRows[i].second.hasRssi ? String(lastResultsRows[i].second.rssi) : String("");
+    csv += "\"" + macP + "\",\"" + src + "\",\"" + rssiStr + "\",\"" + nm + "\"\n";
   }
   lastResultsCSV = csv;
 
@@ -626,12 +672,13 @@ static void buildResultsArtifacts(const std::map<String, Observed>& macMap){
       "background:#1db954;color:#00100a;font-weight:600;border:1px solid #2fe26c}"
     "a.link{color:#78f0a8;text-decoration:none}"
     "a.btn:hover{filter:brightness(1.05)}"
+    ".rssi{display:inline-block;min-width:76px;text-align:center;padding:4px 8px;border-radius:999px;font-weight:700}"".rssi-unk{background:#2a3344;color:#cbd5e1}"".rssi-g{background:#1db954;color:#00100a}"".rssi-y{background:#f4d03f;color:#1b1400}"".rssi-o{background:#ff9f1a;color:#1f1200}"".rssi-r{background:#ff4d4d;color:#1a0000}"
     "</style></head><body><div class='card'>"
     "<h1>Baseline Results</h1>"
-    "<table><tr><th>MAC</th><th>Source</th><th>Complete Local Name</th></tr>"
+    "<table><tr><th>MAC</th><th>Source</th><th>RSSI</th><th>Complete Local Name</th></tr>"
   );
   if (lastResultsRows.empty()){
-    html += F("<tr><td colspan='3'>No devices observed.</td></tr>");
+    html += F("<tr><td colspan='4'>No devices observed.</td></tr>");
   } else {
     for (size_t i=0;i<lastResultsRows.size();++i){
       const String macP = macPretty(lastResultsRows[i].first);
@@ -642,7 +689,7 @@ static void buildResultsArtifacts(const std::map<String, Observed>& macMap){
       html += "<tr><td>"
               "<a class='link' href='/append_filter?v="+oui+"'>"+oui+"</a>:"
               "<a class='link' href='/append_filter?v="+macP+"'>"+dev+"</a>"
-              "</td><td>"+src+"</td><td>"+nm+"</td></tr>";
+              "</td><td>"+src+"</td><td>"+rssiCellHtml(lastResultsRows[i].second)+"</td><td>"+nm+"</td></tr>";
     }
   }
   html += F("</table>"
@@ -668,6 +715,7 @@ static String renderIndexResultsSection(){
     "<div style='overflow-x:auto'><table style='width:100%;border-collapse:collapse;background:#0f1420'>"
     "<tr><th style='text-align:left;border-bottom:1px solid #26354d;padding:8px;color:#9be7a6'>MAC</th>"
     "<th style='text-align:left;border-bottom:1px solid #26354d;padding:8px;color:#9be7a6'>Source</th>"
+    "<th style='text-align:left;border-bottom:1px solid #26354d;padding:8px;color:#9be7a6'>RSSI</th>"
     "<th style='text-align:left;border-bottom:1px solid #26354d;padding:8px;color:#9be7a6'>Complete Local Name</th></tr>"
   );
   for (size_t i=0;i<lastResultsRows.size();++i){
@@ -683,6 +731,7 @@ static String renderIndexResultsSection(){
             "<a href='/append_filter?v="+macP+"' style='color:#78f0a8;text-decoration:none'>"+dev+"</a>"
             "</td>"
             "<td style='border-bottom:1px solid #26354d;padding:8px'>" + src + "</td>"
+            "<td style='border-bottom:1px solid #26354d;padding:8px'>" + rssiCellHtml(lastResultsRows[i].second) + "</td>"
             "<td style='border-bottom:1px solid #26354d;padding:8px'>" + nm + "</td>"
             "</tr>";
   }
