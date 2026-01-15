@@ -4,3 +4,5 @@ I am not a Dev, just proof of concept.
 Yes, I used AI , But it works.
 
 Added color coded rssi to the baseline target scan. 
+Added fox-hunt function
+Segmented functions so prevent continous conflics when editing.
